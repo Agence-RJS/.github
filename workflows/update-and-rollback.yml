@@ -1,0 +1,491 @@
+# ============================================================================
+# Workflow réutilisable : Mise à jour avec rollback automatique
+# ============================================================================
+# Ce workflow peut être appelé par n'importe quel dépôt de l'organisation.
+# Il orchestre : sauvegarde → mise à jour → tests → rollback si échec.
+#
+# Utilisation dans un autre dépôt :
+#   jobs:
+#     update:
+#       uses: Agence-RJS/.github/.github/workflows/update-and-rollback.yml@main
+#       with:
+#         site_url: "https://monsite.com"
+#         update_command: "npm update"
+#         build_command: "npm run build"
+#         test_command: "npm test"
+# ============================================================================
+
+name: "Update & Rollback"
+
+on:
+  workflow_call:
+    inputs:
+      site_url:
+        description: "URL du site à vérifier après mise à jour"
+        required: true
+        type: string
+      update_command:
+        description: "Commande de mise à jour (ex: npm update, composer update)"
+        required: true
+        type: string
+      build_command:
+        description: "Commande de build (ex: npm run build)"
+        required: false
+        type: string
+        default: ""
+      test_command:
+        description: "Commande de tests (ex: npm test)"
+        required: false
+        type: string
+        default: ""
+      deploy_command:
+        description: "Commande de déploiement (ex: npm run deploy)"
+        required: false
+        type: string
+        default: ""
+      node_version:
+        description: "Version de Node.js à utiliser"
+        required: false
+        type: string
+        default: "20"
+      health_check_paths:
+        description: "Chemins à vérifier (séparés par des virgules, ex: /,/about,/contact)"
+        required: false
+        type: string
+        default: "/"
+      visual_regression:
+        description: "Activer la régression visuelle (true/false)"
+        required: false
+        type: boolean
+        default: false
+      visual_regression_pages:
+        description: "Pages pour la régression visuelle (séparées par des virgules)"
+        required: false
+        type: string
+        default: "/"
+      max_rollback_attempts:
+        description: "Nombre maximum de tentatives de rollback"
+        required: false
+        type: number
+        default: 2
+      notify_on_failure:
+        description: "Créer une issue GitHub en cas d'échec"
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      DEPLOY_TOKEN:
+        description: "Token pour le déploiement (optionnel)"
+        required: false
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Étape 1 : Sauvegarde avant mise à jour
+  # ──────────────────────────────────────────────
+  snapshot:
+    name: "📸 Sauvegarde pré-mise à jour"
+    runs-on: ubuntu-latest
+    outputs:
+      snapshot_sha: ${{ steps.save.outputs.sha }}
+      snapshot_branch: ${{ steps.save.outputs.branch }}
+      lockfile_artifact: ${{ steps.save.outputs.lockfile_artifact }}
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sauvegarder l'état actuel
+        id: save
+        run: |
+          SHA=$(git rev-parse HEAD)
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "lockfile_artifact=lockfiles-$SHA" >> "$GITHUB_OUTPUT"
+          echo "✅ Snapshot créé : $SHA sur $BRANCH"
+
+      - name: Sauvegarder les fichiers de lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: lockfiles-${{ steps.save.outputs.sha }}
+          path: |
+            package-lock.json
+            yarn.lock
+            pnpm-lock.yaml
+            composer.lock
+            Gemfile.lock
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Capture d'écran pré-mise à jour (régression visuelle)
+        if: inputs.visual_regression
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Installer Playwright pour screenshots
+        if: inputs.visual_regression
+        run: |
+          npm install -g playwright
+          npx playwright install chromium --with-deps
+
+      - name: Prendre les captures d'écran de référence
+        if: inputs.visual_regression
+        run: |
+          IFS=',' read -ra PAGES <<< "${{ inputs.visual_regression_pages }}"
+          mkdir -p screenshots/before
+          for page in "${PAGES[@]}"; do
+            SAFE_NAME=$(echo "$page" | sed 's/[^a-zA-Z0-9]/_/g')
+            npx playwright screenshot \
+              --full-page \
+              "${{ inputs.site_url }}${page}" \
+              "screenshots/before/${SAFE_NAME}.png" || true
+          done
+
+      - name: Uploader les screenshots de référence
+        if: inputs.visual_regression
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-before
+          path: screenshots/before/
+          retention-days: 7
+
+  # ──────────────────────────────────────────────
+  # Étape 2 : Mise à jour
+  # ──────────────────────────────────────────────
+  update:
+    name: "🔄 Mise à jour"
+    needs: snapshot
+    runs-on: ubuntu-latest
+    outputs:
+      update_success: ${{ steps.run_update.outputs.success }}
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: "npm"
+
+      - name: Exécuter la mise à jour
+        id: run_update
+        run: |
+          echo "🔄 Exécution : ${{ inputs.update_command }}"
+          if ${{ inputs.update_command }}; then
+            echo "success=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Mise à jour réussie"
+          else
+            echo "success=false" >> "$GITHUB_OUTPUT"
+            echo "❌ Mise à jour échouée"
+            exit 1
+          fi
+
+      - name: Build du projet
+        if: inputs.build_command != ''
+        run: |
+          echo "🏗️ Build : ${{ inputs.build_command }}"
+          ${{ inputs.build_command }}
+
+      - name: Exécuter les tests
+        if: inputs.test_command != ''
+        run: |
+          echo "🧪 Tests : ${{ inputs.test_command }}"
+          ${{ inputs.test_command }}
+
+      - name: Sauvegarder le build mis à jour
+        uses: actions/upload-artifact@v4
+        with:
+          name: updated-build
+          path: |
+            .
+            !.git
+            !node_modules
+          retention-days: 1
+
+  # ──────────────────────────────────────────────
+  # Étape 3 : Vérification post-mise à jour
+  # ──────────────────────────────────────────────
+  verify:
+    name: "✅ Vérification"
+    needs: [snapshot, update]
+    runs-on: ubuntu-latest
+    outputs:
+      health_ok: ${{ steps.health.outputs.healthy }}
+      visual_ok: ${{ steps.visual.outputs.visual_ok }}
+      all_checks_passed: ${{ steps.summary.outputs.all_passed }}
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Health Check — vérifier que le site répond
+        id: health
+        run: |
+          HEALTHY=true
+          IFS=',' read -ra PATHS <<< "${{ inputs.health_check_paths }}"
+          for path in "${PATHS[@]}"; do
+            URL="${{ inputs.site_url }}${path}"
+            echo "🔍 Vérification : $URL"
+
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$URL" || echo "000")
+
+            if [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 400 ]]; then
+              echo "  ✅ $URL → HTTP $HTTP_CODE"
+            else
+              echo "  ❌ $URL → HTTP $HTTP_CODE"
+              HEALTHY=false
+            fi
+          done
+
+          echo "healthy=$HEALTHY" >> "$GITHUB_OUTPUT"
+          if [ "$HEALTHY" = "false" ]; then
+            echo "::error::Health check échoué pour une ou plusieurs pages"
+          fi
+
+      - name: Setup pour régression visuelle
+        if: inputs.visual_regression
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Installer Playwright
+        if: inputs.visual_regression
+        run: |
+          npm install -g playwright pixelmatch pngjs
+          npx playwright install chromium --with-deps
+
+      - name: Télécharger screenshots de référence
+        if: inputs.visual_regression
+        uses: actions/download-artifact@v4
+        with:
+          name: screenshots-before
+          path: screenshots/before/
+
+      - name: Régression visuelle — comparer avant/après
+        if: inputs.visual_regression
+        id: visual
+        run: |
+          IFS=',' read -ra PAGES <<< "${{ inputs.visual_regression_pages }}"
+          mkdir -p screenshots/after screenshots/diff
+          VISUAL_OK=true
+
+          for page in "${PAGES[@]}"; do
+            SAFE_NAME=$(echo "$page" | sed 's/[^a-zA-Z0-9]/_/g')
+
+            npx playwright screenshot \
+              --full-page \
+              "${{ inputs.site_url }}${page}" \
+              "screenshots/after/${SAFE_NAME}.png" || true
+
+            if [ -f "screenshots/before/${SAFE_NAME}.png" ] && [ -f "screenshots/after/${SAFE_NAME}.png" ]; then
+              node -e "
+                const fs = require('fs');
+                const { PNG } = require('pngjs');
+                const pixelmatch = require('pixelmatch');
+
+                const before = PNG.sync.read(fs.readFileSync('screenshots/before/${SAFE_NAME}.png'));
+                const after = PNG.sync.read(fs.readFileSync('screenshots/after/${SAFE_NAME}.png'));
+
+                const width = Math.min(before.width, after.width);
+                const height = Math.min(before.height, after.height);
+                const diff = new PNG({ width, height });
+
+                const mismatch = pixelmatch(
+                  before.data, after.data, diff.data,
+                  width, height,
+                  { threshold: 0.1 }
+                );
+
+                const totalPixels = width * height;
+                const diffPercent = ((mismatch / totalPixels) * 100).toFixed(2);
+
+                fs.writeFileSync('screenshots/diff/${SAFE_NAME}.png', PNG.sync.write(diff));
+                console.log('Page ${page}: ' + diffPercent + '% de différence (' + mismatch + ' pixels)');
+
+                if (parseFloat(diffPercent) > 5) {
+                  console.log('::warning::Régression visuelle détectée sur ${page}: ' + diffPercent + '%');
+                  process.exit(1);
+                }
+              " || VISUAL_OK=false
+            fi
+          done
+
+          echo "visual_ok=$VISUAL_OK" >> "$GITHUB_OUTPUT"
+
+      - name: Uploader les screenshots de comparaison
+        if: inputs.visual_regression && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-comparison
+          path: screenshots/
+          retention-days: 7
+
+      - name: Résumé des vérifications
+        id: summary
+        run: |
+          HEALTH="${{ steps.health.outputs.healthy }}"
+          VISUAL="${{ steps.visual.outputs.visual_ok }}"
+
+          # Si pas de régression visuelle, on considère OK
+          if [ -z "$VISUAL" ]; then
+            VISUAL="true"
+          fi
+
+          if [ "$HEALTH" = "true" ] && [ "$VISUAL" = "true" ]; then
+            echo "all_passed=true" >> "$GITHUB_OUTPUT"
+            echo "🎉 Toutes les vérifications ont réussi !"
+          else
+            echo "all_passed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Des vérifications ont échoué — rollback nécessaire"
+            echo "  Health: $HEALTH"
+            echo "  Visual: $VISUAL"
+          fi
+
+  # ──────────────────────────────────────────────
+  # Étape 4 : Déploiement (si tout est OK)
+  # ──────────────────────────────────────────────
+  deploy:
+    name: "🚀 Déploiement"
+    needs: [snapshot, update, verify]
+    if: needs.verify.outputs.all_checks_passed == 'true' && inputs.deploy_command != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Télécharger le build mis à jour
+        uses: actions/download-artifact@v4
+        with:
+          name: updated-build
+
+      - name: Déployer
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: |
+          echo "🚀 Déploiement : ${{ inputs.deploy_command }}"
+          ${{ inputs.deploy_command }}
+
+  # ──────────────────────────────────────────────
+  # Étape 5 : Rollback automatique (si échec)
+  # ──────────────────────────────────────────────
+  rollback:
+    name: "⏪ Rollback"
+    needs: [snapshot, update, verify]
+    if: failure() || needs.verify.outputs.all_checks_passed == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.DEPLOY_TOKEN || github.token }}
+
+      - name: Restaurer les fichiers de lock
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.snapshot.outputs.lockfile_artifact }}
+          path: .
+        continue-on-error: true
+
+      - name: Rollback vers le snapshot
+        id: rollback
+        run: |
+          SNAPSHOT_SHA="${{ needs.snapshot.outputs.snapshot_sha }}"
+          BRANCH="${{ needs.snapshot.outputs.snapshot_branch }}"
+          MAX_ATTEMPTS=${{ inputs.max_rollback_attempts }}
+          ATTEMPT=0
+          ROLLBACK_OK=false
+
+          echo "⏪ Rollback vers $SNAPSHOT_SHA sur $BRANCH"
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ] && [ "$ROLLBACK_OK" = "false" ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Tentative $ATTEMPT/$MAX_ATTEMPTS..."
+
+            if git revert --no-commit HEAD...$SNAPSHOT_SHA 2>/dev/null; then
+              git commit -m "rollback: restauration vers $SNAPSHOT_SHA (auto-rollback après échec de mise à jour)" || true
+              ROLLBACK_OK=true
+              echo "✅ Rollback réussi (tentative $ATTEMPT)"
+            else
+              git revert --abort 2>/dev/null || true
+              # Fallback : reset dur
+              if git reset --hard "$SNAPSHOT_SHA"; then
+                ROLLBACK_OK=true
+                echo "✅ Rollback par reset réussi (tentative $ATTEMPT)"
+              fi
+            fi
+          done
+
+          echo "rollback_success=$ROLLBACK_OK" >> "$GITHUB_OUTPUT"
+
+          if [ "$ROLLBACK_OK" = "false" ]; then
+            echo "::error::Rollback échoué après $MAX_ATTEMPTS tentatives"
+            exit 1
+          fi
+
+      - name: Pousser le rollback
+        if: steps.rollback.outputs.rollback_success == 'true'
+        run: |
+          BRANCH="${{ needs.snapshot.outputs.snapshot_branch }}"
+          git push origin "$BRANCH" --force-with-lease
+
+      - name: Vérifier le site après rollback
+        if: steps.rollback.outputs.rollback_success == 'true'
+        run: |
+          echo "🔍 Vérification post-rollback..."
+          sleep 30
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "${{ inputs.site_url }}" || echo "000")
+          if [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 400 ]]; then
+            echo "✅ Site accessible après rollback (HTTP $HTTP_CODE)"
+          else
+            echo "::warning::Le site ne répond pas correctement après rollback (HTTP $HTTP_CODE)"
+          fi
+
+  # ──────────────────────────────────────────────
+  # Étape 6 : Notification (issue GitHub)
+  # ──────────────────────────────────────────────
+  notify:
+    name: "📢 Notification"
+    needs: [snapshot, update, verify, rollback]
+    if: always() && inputs.notify_on_failure && (failure() || needs.verify.outputs.all_checks_passed == 'false')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Créer une issue d'alerte
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const snapshotSha = '${{ needs.snapshot.outputs.snapshot_sha }}';
+            const healthOk = '${{ needs.verify.outputs.health_ok }}';
+            const visualOk = '${{ needs.verify.outputs.visual_ok }}';
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+
+            let body = `## ⚠️ Échec de mise à jour — Rollback automatique\n\n`;
+            body += `**Date** : ${new Date().toISOString()}\n`;
+            body += `**Snapshot de référence** : \`${snapshotSha}\`\n`;
+            body += `**Run** : [Voir les logs](${runUrl})\n\n`;
+            body += `### Résultat des vérifications\n\n`;
+            body += `| Vérification | Résultat |\n`;
+            body += `|---|---|\n`;
+            body += `| Health Check | ${healthOk === 'true' ? '✅' : '❌'} |\n`;
+            body += `| Régression Visuelle | ${visualOk === 'true' || visualOk === '' ? '✅' : '❌'} |\n\n`;
+            body += `### Actions recommandées\n\n`;
+            body += `1. Consulter les logs du workflow ci-dessus\n`;
+            body += `2. Identifier la dépendance ou le changement responsable\n`;
+            body += `3. Corriger le problème et relancer la mise à jour\n`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Échec mise à jour — Rollback effectué (${new Date().toISOString().split('T')[0]})`,
+              body: body,
+              labels: ['bug', 'rollback', 'auto-generated']
+            });

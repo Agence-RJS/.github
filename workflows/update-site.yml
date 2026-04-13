@@ -1,0 +1,55 @@
+# ============================================================================
+# Exemple de workflow appelant : à copier dans chaque dépôt de site
+# ============================================================================
+# Ce fichier montre comment utiliser le workflow réutilisable
+# update-and-rollback.yml depuis un dépôt de site.
+#
+# Copiez ce fichier dans votre dépôt :
+#   .github/workflows/update-site.yml
+#
+# Puis adaptez les paramètres à votre projet.
+# ============================================================================
+
+name: "Mise à jour du site"
+
+on:
+  # Planification automatique (chaque lundi à 8h)
+  schedule:
+    - cron: "0 8 * * 1"
+
+  # Déclenchement manuel
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: "Forcer la mise à jour même si aucune dépendance n'a changé"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  update:
+    uses: Agence-RJS/.github/.github/workflows/update-and-rollback.yml@main
+    with:
+      # ── URL du site en production ──
+      site_url: "https://votre-site.com"
+
+      # ── Commandes de votre projet ──
+      update_command: "npm update"
+      build_command: "npm run build"
+      test_command: "npm test"
+      deploy_command: ""  # Ex: "npx netlify deploy --prod" ou "npm run deploy"
+
+      # ── Options ──
+      node_version: "20"
+      health_check_paths: "/,/about,/contact"
+
+      # ── Régression visuelle (optionnel) ──
+      visual_regression: false
+      visual_regression_pages: "/,/about"
+
+      # ── Rollback ──
+      max_rollback_attempts: 2
+      notify_on_failure: true
+
+    secrets:
+      DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
