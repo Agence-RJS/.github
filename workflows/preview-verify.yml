@@ -1,0 +1,299 @@
+# ============================================================================
+# Workflow réutilisable : Vérification sur environnement de preview
+# ============================================================================
+# À appeler AVANT de merger une PR de mise à jour.
+# Vérifie un deploy preview (Vercel, Netlify, etc.) pour s'assurer
+# que rien n'est cassé pour les utilisateurs finaux.
+#
+# Utilisable seul ou appelé par la Routine autonome.
+# ============================================================================
+
+name: "Preview Verify"
+
+on:
+  workflow_call:
+    inputs:
+      preview_url:
+        description: "URL de l'environnement de preview à tester"
+        required: true
+        type: string
+      production_url:
+        description: "URL de production (pour comparaison visuelle)"
+        required: true
+        type: string
+      routes:
+        description: "Routes critiques à tester, format CSV: chemin,code_attendu,contenu_attendu (séparées par |)"
+        required: false
+        type: string
+        default: "/,200,"
+      visual_pages:
+        description: "Pages pour la régression visuelle (séparées par des virgules)"
+        required: false
+        type: string
+        default: "/"
+      visual_threshold:
+        description: "Seuil max de différence visuelle en % (au-delà = échec)"
+        required: false
+        type: number
+        default: 2
+      max_response_time:
+        description: "Temps de réponse max en ms (au-delà = warning)"
+        required: false
+        type: number
+        default: 3000
+      node_version:
+        description: "Version Node.js"
+        required: false
+        type: string
+        default: "20"
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Test 1 : Smoke test — toutes les routes répondent
+  # ──────────────────────────────────────────────
+  smoke-test:
+    name: "🔍 Smoke Test (routes & contenu)"
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.smoke.outputs.passed }}
+      report: ${{ steps.smoke.outputs.report }}
+    steps:
+      - name: Checkout (pour les scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: Agence-RJS/.github
+          path: infra
+
+      - name: Tester les routes
+        id: smoke
+        run: |
+          PASSED=true
+          REPORT=""
+          IFS='|' read -ra ROUTES <<< "${{ inputs.routes }}"
+
+          for route_entry in "${ROUTES[@]}"; do
+            IFS=',' read -r path expected_code expected_content <<< "$route_entry"
+            path=$(echo "$path" | xargs)
+            expected_code=$(echo "$expected_code" | xargs)
+            expected_content=$(echo "$expected_content" | xargs)
+
+            URL="${{ inputs.preview_url }}${path}"
+
+            RESPONSE=$(curl -s -w "\n%{http_code}\n%{time_total}" \
+              --max-time 15 "$URL" 2>/dev/null || echo -e "\n000\n0")
+
+            BODY=$(echo "$RESPONSE" | sed '$d' | sed '$d')
+            HTTP_CODE=$(echo "$RESPONSE" | tail -2 | head -1)
+            TIME_S=$(echo "$RESPONSE" | tail -1)
+            TIME_MS=$(echo "$TIME_S" | awk '{printf "%.0f", $1 * 1000}')
+
+            ROUTE_OK=true
+
+            if [ -n "$expected_code" ] && [ "$HTTP_CODE" != "$expected_code" ]; then
+              ROUTE_OK=false
+            fi
+
+            if [ -n "$expected_content" ] && ! echo "$BODY" | grep -qi "$expected_content"; then
+              ROUTE_OK=false
+            fi
+
+            if [ "$ROUTE_OK" = true ]; then
+              echo "✅ $path → HTTP $HTTP_CODE (${TIME_MS}ms)"
+              REPORT="${REPORT}✅ ${path} (HTTP ${HTTP_CODE}, ${TIME_MS}ms)\n"
+
+              if [ "$TIME_MS" -gt "${{ inputs.max_response_time }}" ] 2>/dev/null; then
+                echo "::warning::⚠️ $path lent : ${TIME_MS}ms (seuil: ${{ inputs.max_response_time }}ms)"
+                REPORT="${REPORT}⚠️ ${path} lent : ${TIME_MS}ms\n"
+              fi
+            else
+              echo "::error::❌ $path → HTTP $HTTP_CODE"
+              PASSED=false
+              REPORT="${REPORT}❌ ${path} ÉCHEC (HTTP ${HTTP_CODE})\n"
+            fi
+          done
+
+          echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
+          echo "report<<ENDREPORT" >> "$GITHUB_OUTPUT"
+          echo -e "$REPORT" >> "$GITHUB_OUTPUT"
+          echo "ENDREPORT" >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────
+  # Test 2 : Régression visuelle — preview vs production
+  # ──────────────────────────────────────────────
+  visual-regression:
+    name: "👁️ Régression visuelle (preview vs prod)"
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.compare.outputs.passed }}
+      report: ${{ steps.compare.outputs.report }}
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Installer les outils
+        run: |
+          npm install -g playwright pixelmatch pngjs
+          npx playwright install chromium --with-deps
+
+      - name: Capturer production (référence)
+        run: |
+          IFS=',' read -ra PAGES <<< "${{ inputs.visual_pages }}"
+          mkdir -p screenshots/production screenshots/preview screenshots/diff
+          for page in "${PAGES[@]}"; do
+            SAFE=$(echo "$page" | sed 's/[^a-zA-Z0-9]/_/g')
+            npx playwright screenshot --full-page \
+              "${{ inputs.production_url }}${page}" \
+              "screenshots/production/${SAFE}.png" || true
+          done
+
+      - name: Capturer preview
+        run: |
+          IFS=',' read -ra PAGES <<< "${{ inputs.visual_pages }}"
+          for page in "${PAGES[@]}"; do
+            SAFE=$(echo "$page" | sed 's/[^a-zA-Z0-9]/_/g')
+            npx playwright screenshot --full-page \
+              "${{ inputs.preview_url }}${page}" \
+              "screenshots/preview/${SAFE}.png" || true
+          done
+
+      - name: Comparer production vs preview
+        id: compare
+        run: |
+          PASSED=true
+          REPORT=""
+          THRESHOLD=${{ inputs.visual_threshold }}
+
+          for prod_file in screenshots/production/*.png; do
+            [ -f "$prod_file" ] || continue
+            FILENAME=$(basename "$prod_file")
+            PREVIEW_FILE="screenshots/preview/${FILENAME}"
+            DIFF_FILE="screenshots/diff/${FILENAME}"
+
+            if [ ! -f "$PREVIEW_FILE" ]; then
+              echo "::warning::Pas de capture preview pour $FILENAME"
+              continue
+            fi
+
+            DIFF_PCT=$(node -e "
+              const fs = require('fs');
+              const { PNG } = require('pngjs');
+              const pixelmatch = require('pixelmatch');
+
+              const prod = PNG.sync.read(fs.readFileSync('${prod_file}'));
+              const prev = PNG.sync.read(fs.readFileSync('${PREVIEW_FILE}'));
+
+              const w = Math.min(prod.width, prev.width);
+              const h = Math.min(prod.height, prev.height);
+              const diff = new PNG({ width: w, height: h });
+
+              const mismatch = pixelmatch(prod.data, prev.data, diff.data, w, h, { threshold: 0.1 });
+              const pct = ((mismatch / (w * h)) * 100).toFixed(2);
+
+              fs.writeFileSync('${DIFF_FILE}', PNG.sync.write(diff));
+              console.log(pct);
+            " 2>/dev/null || echo "-1")
+
+            PAGE_NAME=$(echo "$FILENAME" | sed 's/_/\//g; s/\.png//')
+            if [ "$DIFF_PCT" = "-1" ]; then
+              echo "::warning::Erreur de comparaison pour $PAGE_NAME"
+              REPORT="${REPORT}⚠️ ${PAGE_NAME}: erreur de comparaison\n"
+            elif (( $(echo "$DIFF_PCT > $THRESHOLD" | bc -l) )); then
+              echo "::error::❌ $PAGE_NAME : ${DIFF_PCT}% de différence (seuil: ${THRESHOLD}%)"
+              PASSED=false
+              REPORT="${REPORT}❌ ${PAGE_NAME}: ${DIFF_PCT}% de différence (RÉGRESSION)\n"
+            else
+              echo "✅ $PAGE_NAME : ${DIFF_PCT}% de différence"
+              REPORT="${REPORT}✅ ${PAGE_NAME}: ${DIFF_PCT}%\n"
+            fi
+          done
+
+          echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
+          echo "report<<ENDREPORT" >> "$GITHUB_OUTPUT"
+          echo -e "$REPORT" >> "$GITHUB_OUTPUT"
+          echo "ENDREPORT" >> "$GITHUB_OUTPUT"
+
+      - name: Sauvegarder les captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-screenshots
+          path: screenshots/
+          retention-days: 7
+
+  # ──────────────────────────────────────────────
+  # Test 3 : Taille du bundle (détection de régressions de perf)
+  # ──────────────────────────────────────────────
+  bundle-size:
+    name: "📦 Vérification taille du bundle"
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+    steps:
+      - name: Vérifier les réponses
+        id: check
+        run: |
+          PASSED=true
+          IFS=',' read -ra PAGES <<< "${{ inputs.visual_pages }}"
+          for page in "${PAGES[@]}"; do
+            page=$(echo "$page" | xargs)
+            URL="${{ inputs.preview_url }}${page}"
+
+            SIZE=$(curl -s -o /dev/null -w "%{size_download}" --max-time 30 "$URL" 2>/dev/null || echo "0")
+            SIZE_KB=$((SIZE / 1024))
+
+            if [ "$SIZE" -eq 0 ]; then
+              echo "::error::❌ $page : aucune réponse"
+              PASSED=false
+            elif [ "$SIZE_KB" -gt 5000 ]; then
+              echo "::warning::⚠️ $page : ${SIZE_KB} KB (volumineux)"
+            else
+              echo "✅ $page : ${SIZE_KB} KB"
+            fi
+          done
+
+          echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────
+  # Verdict final
+  # ──────────────────────────────────────────────
+  verdict:
+    name: "📋 Verdict"
+    needs: [smoke-test, visual-regression, bundle-size]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      safe_to_merge: ${{ steps.decide.outputs.safe }}
+    steps:
+      - name: Décision
+        id: decide
+        run: |
+          SMOKE="${{ needs.smoke-test.outputs.passed }}"
+          VISUAL="${{ needs.visual-regression.outputs.passed }}"
+          BUNDLE="${{ needs.bundle-size.outputs.passed }}"
+
+          echo "┌────────────────────────────────────┐"
+          echo "│        RAPPORT DE VÉRIFICATION     │"
+          echo "├────────────────────────────────────┤"
+          echo "│ Smoke test (routes)  : $SMOKE"
+          echo "│ Régression visuelle  : $VISUAL"
+          echo "│ Taille du bundle     : $BUNDLE"
+          echo "└────────────────────────────────────┘"
+          echo ""
+
+          echo "### Smoke Test" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ needs.smoke-test.outputs.report }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Régression Visuelle" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ needs.visual-regression.outputs.report }}" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$SMOKE" = "true" ] && [ "$VISUAL" = "true" ] && [ "$BUNDLE" = "true" ]; then
+            echo "safe=true" >> "$GITHUB_OUTPUT"
+            echo ""
+            echo "✅ VERDICT : SAFE TO MERGE — aucune régression détectée"
+          else
+            echo "safe=false" >> "$GITHUB_OUTPUT"
+            echo ""
+            echo "🚫 VERDICT : NE PAS MERGER — régressions détectées"
+            exit 1
+          fi

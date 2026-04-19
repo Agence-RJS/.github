@@ -202,3 +202,110 @@ with:
   test_command: ""
   health_check_paths: "/admin,/_health"
 ```
+
+## Vérification pré-déploiement (preview-verify)
+
+Le workflow `preview-verify.yml` compare un **environnement de preview** à la
+**production** pour garantir zéro régression visible par les clients :
+
+1. **Smoke test** — chaque route critique répond avec le bon code HTTP et le bon contenu
+2. **Régression visuelle** — comparaison pixel par pixel entre production et preview (seuil configurable, défaut 2%)
+3. **Taille du bundle** — détection des pages anormalement volumineuses
+4. **Verdict** — feu vert ou blocage du merge
+
+```yaml
+jobs:
+  verify:
+    uses: Agence-RJS/.github/.github/workflows/preview-verify.yml@main
+    with:
+      preview_url: "https://preview-abc123.vercel.app"
+      production_url: "https://monsite.com"
+      routes: "/,200,Bienvenue|/about,200,À propos|/contact,200,Formulaire"
+      visual_pages: "/,/about,/contact"
+      visual_threshold: 2
+      max_response_time: 3000
+```
+
+### Script smoke-test (usage local)
+
+```bash
+# Créez un fichier routes.csv :
+cat > routes.csv << 'EOF'
+/,200,Bienvenue
+/about,200,À propos
+/contact,200,Formulaire
+/api/health,200,ok
+EOF
+
+# Lancez le smoke test :
+./scripts/smoke-test.sh https://monsite.com routes.csv
+```
+
+## Routine Claude Code (autonome)
+
+Pour configurer une Routine autonome sur [claude.ai/code/routines](https://claude.ai/code/routines),
+utilisez le prompt ci-dessous. La Routine ouvre des PR mais **ne merge jamais** —
+un humain valide toujours avant déploiement.
+
+### Prompt recommandé
+
+```
+Tu es responsable de la maintenance hebdomadaire des sites actifs
+d'Agence RJS.
+
+REPOS ACTIFS :
+- easy-crm, portfolio, florifile, ideo-habitat
+- Bonappli2026, bonappli-backend, bonappli-front
+- agence-rjs, wagner-avocat, CRM
+
+RÈGLE ABSOLUE : ZÉRO IMPACT CLIENT
+Les utilisateurs finaux ne doivent jamais voir de régression,
+page cassée, erreur 500, ou changement visuel non voulu.
+
+ÉTAPES (par repo, séquentiellement) :
+
+1. VÉRIFICATION PRÉ-UPDATE
+   - Lire le package.json (ou composer.json)
+   - Lister les mises à jour disponibles avec `npm outdated`
+   - BLOQUER toute montée de version majeure (ex: 18.x → 19.x)
+     → Ouvrir une issue séparée au lieu d'upgrader
+
+2. MISE À JOUR SAFE
+   - Créer une branche "auto-update-YYYYMMDD"
+   - Exécuter `npm update` (mineures + patches uniquement)
+   - Si le projet a un lockfile, s'assurer qu'il est mis à jour
+
+3. BUILD & TESTS
+   - `npm run build` — si échec → abandonner, ouvrir une issue
+   - `npm test` (si disponible) — si échec → abandonner, ouvrir une issue
+   - `npm run lint` (si disponible) — si échec → abandonner
+
+4. VÉRIFICATION PRE-DEPLOY (si un preview URL est disponible)
+   - Comparer visuellement le preview vs la production
+   - Tester chaque route connue (/, /about, /login, etc.)
+   - Vérifier que le temps de réponse est < 3 secondes
+   - Si la différence visuelle dépasse 2% → BLOQUER
+
+5. PR SEULEMENT SI TOUT EST VERT
+   - Titre : "🤖 Maj dépendances — YYYYMMDD"
+   - Corps : diff package.json, résumé des changements, résultat
+     des vérifications (routes, visuel, build, tests)
+   - Label : "automated"
+   - ⚠️ NE JAMAIS MERGER — laisser un humain valider
+
+6. RÉSUMÉ FINAL
+   Poster un récapitulatif :
+   ✅ Repos mis à jour (PR ouverte)
+   ⚠️ Repos avec version majeure disponible (issue créée)
+   ❌ Repos en erreur (issue créée avec les logs)
+   ⏭️ Repos skippés (inactifs >30j)
+
+SI DOUTE → NE PAS MODIFIER. Ouvrir une issue pour demander une
+décision humaine. Mieux vaut ne rien faire que casser un site en prod.
+```
+
+### Configuration
+
+- **Trigger** : Schedule hebdomadaire (lundi 8h)
+- **Repos** : sélectionner uniquement les repos actifs listés ci-dessus
+- **Connecteurs** : Slack (pour les notifications de résumé)
